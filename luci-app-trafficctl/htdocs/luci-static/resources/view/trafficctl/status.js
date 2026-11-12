@@ -1758,6 +1758,20 @@ function buildSearchSelect(devices, placeholder, onSelect) {
 		dropdown.classList.remove('tc-hidden');
 	});
 	input.addEventListener('input', function() {
+		// An empty field is the same action as picking "All active devices":
+		// leave the device page and show the overview. A partial filter must
+		// not do this — only a fully cleared value (backspace/delete, or the
+		// × button which also goes through selectItem).
+		if (!input.value) {
+			if (selectedValue !== '__all__') {
+				selectItem('__all__', '');
+			} else {
+				clearBtn.classList.add('tc-hidden');
+				renderItems('');
+				dropdown.classList.remove('tc-hidden');
+			}
+			return;
+		}
 		renderItems(input.value);
 		dropdown.classList.remove('tc-hidden');
 	});
@@ -1786,9 +1800,14 @@ function buildSearchSelect(devices, placeholder, onSelect) {
 			input.blur();
 		}
 	});
-	clearBtn.addEventListener('click', function() {
+	// preventDefault on mousedown stops the input from blurring and then
+	// re-opening the dropdown; the user clicked × to leave the device page,
+	// not to keep searching. Without this they land on an open list and have
+	// to pick "All active devices" by hand.
+	clearBtn.addEventListener('mousedown', function(ev) { ev.preventDefault(); });
+	clearBtn.addEventListener('click', function(ev) {
+		ev.preventDefault();
 		selectItem('__all__', '');
-		input.focus();
 	});
 
 	return {
@@ -3142,6 +3161,9 @@ return view.extend({
 			pollStart();
 
 			callDevice(ip, proto).then(function(data) {
+				// A late reply must not rebuild the device page after the user
+				// has gone back to the overview (or opened a different device).
+				if (gen !== self._queryGen) { pollEnd(null); return; }
 				if (!data || data.error) {
 					pollEnd((data && data.error) || _('Unknown error'));
 					return;
@@ -3299,7 +3321,10 @@ return view.extend({
 				}
 				pollEnd();
 			})
-			.catch(function(e) { pollEnd(e.message); });
+			.catch(function(e) {
+				if (gen !== self._queryGen) { pollEnd(null); return; }
+				pollEnd(e.message);
+			});
 		}
 
 		self._tableFilter = null;
@@ -3477,9 +3502,12 @@ return view.extend({
 		}
 
 		function runAll() {
+			self._queryGen++;
+			var gen = self._queryGen;
 			pollStart();
 
 			callTrafficctl().then(function(rows) {
+				if (gen !== self._queryGen) { pollEnd(null); return; }
 				if (!Array.isArray(rows)) rows = [];
 				searchSelect.updateDevices(rows);
 				renderSummary(rows);
@@ -3497,7 +3525,10 @@ return view.extend({
 				pollEnd();
 				self._startBytesPoll();
 			})
-			.catch(function(e) { pollEnd(e.message); });
+			.catch(function(e) {
+				if (gen !== self._queryGen) { pollEnd(null); return; }
+				pollEnd(e.message);
+			});
 		}
 
 		function updateExtendedStats() {
