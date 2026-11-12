@@ -397,6 +397,94 @@ if [ "$DO_RDNS" = "1" ]; then
     fi
 fi
 
+# Tag each connection with a netifyd app / hostname when a previous collect
+# left a labels cache. The device path never samples the socket itself — that
+# is too expensive on a 128–512 MB router, and the summary already refreshes
+# the cache on its own interval. Missing file, disabled integration, or no
+# matching 4-tuple all leave the JSON unchanged so the view degrades to the
+# plain conntrack list (and optional rDNS).
+LABELS="${TCTL_NETIFY_LABELS:-/tmp/trafficctl_netify_labels}"
+if [ "$(uci -q get trafficctl.main.netify_enabled 2>/dev/null)" != "0" ] && [ -s "$LABELS" ]; then
+    CONNS_OUT=$(printf '%s\n' "$CONNS_OUT" | awk -v labels="$LABELS" -v ip="$IP" '
+    function clean(s) {
+        gsub(/[^a-zA-Z0-9._-]/, "", s)
+        return s
+    }
+    function jstr(s, key,   re, seg) {
+        re = "\"" key "\"[ \t]*:[ \t]*"
+        if (!match(s, re)) return ""
+        seg = substr(s, RSTART + RLENGTH)
+        if (substr(seg, 1, 1) == "\"") {
+            seg = substr(seg, 2)
+            if (!match(seg, /"/)) return ""
+            return substr(seg, 1, RSTART - 1)
+        }
+        if (!match(seg, /-?[0-9]+/)) return ""
+        return substr(seg, RSTART, RLENGTH)
+    }
+    function remember(lkey, app, host,    n, f) {
+        apps[lkey] = app
+        hosts[lkey] = host
+        n = split(lkey, f, " ")
+        if (n >= 4) {
+            bydst[f[1] " " f[2]] = lkey
+            noport[f[1] " " f[2] " " f[3]] = lkey
+        }
+    }
+    function lookup(dst, proto, port,   k) {
+        k = ip " " dst " " proto " " port
+        if (k in apps) return k
+        k = ip " " dst " - " port
+        if (k in apps) return k
+        k = ip " " dst " " proto " 0"
+        if (k in apps) return k
+        k = ip " " dst " - 0"
+        if (k in apps) return k
+        k = ip " " dst " " proto
+        if (k in noport) return noport[k]
+        k = ip " " dst
+        if (k in bydst) return bydst[k]
+        return ""
+    }
+    BEGIN {
+        while ((getline line < labels) > 0) {
+            if (split(line, f, " ") < 5) continue
+            app = clean(f[5])
+            host = (f[6] == "-" || f[6] == "") ? "" : clean(f[6])
+            if (app == "") continue
+            remember(f[1] " " f[2] " " f[3] " " f[4], app, host)
+        }
+        close(labels)
+    }
+    {
+        # The connections blob is a comma-separated list of objects, possibly
+        # all on one line. Split the same way parse_flows does — "},{ " as a
+        # regex is not portable on BusyBox awk.
+        gsub(/[}],[{]/, "}\n{")
+        nsplit = split($0, tmp, "\n")
+        for (i = 1; i <= nsplit; i++) obj[++n] = tmp[i]
+    }
+    END {
+        for (i = 1; i <= n; i++) {
+            s = obj[i]
+            dst = jstr(s, "dst")
+            proto = jstr(s, "proto")
+            port = jstr(s, "port")
+            k = lookup(dst, proto, port)
+            if (k != "") {
+                app = apps[k]
+                host = hosts[k]
+                if (app == "unclassified" && host == "") k = ""
+            }
+            if (k != "") {
+                sub(/}[[:space:]]*$/, ",\"app\":\"" app "\",\"app_host\":\"" host "\"}", s)
+            }
+            if (i > 1) printf ","
+            printf "%s", s
+        }
+    }')
+fi
+
 # Listed as blocked yet associated right now = the radio never got the block.
 WIFI_PENDING=false
 tctl_wifi_block_pending "$([ "$WIFI_BLOCKED" = "true" ] && echo 1 || echo 0)" "$CONN_TYPE" \

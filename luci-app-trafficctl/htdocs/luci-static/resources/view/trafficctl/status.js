@@ -220,6 +220,7 @@ var RATE_PRESETS = [
 
 var GROUP_OPTS = [
 	{v:'none',    l: _('None (per-flow)')},
+	{v:'app',     l: _('App / hostname')},
 	{v:'host',    l: _('Hostname / Dst IP')},
 	{v:'service', l: _('Service')},
 	{v:'port',    l: _('Port')},
@@ -1066,29 +1067,57 @@ function cidrOverlaps(a, b) {
 	return Math.floor(a.base / block) === Math.floor(b.base / block);
 }
 
+// Netify-derived labels on a connection, plus rDNS as a fallback. Empty when
+// the agent is off or this flow was never classified — callers treat that as
+// "just show the IP".
+function connAppName(c) {
+	var a = c && c.app;
+	if (!a || a === 'unclassified') return '';
+	return a;
+}
+
+function connHostName(c) {
+	if (!c) return '';
+	if (c.app_host) return c.app_host;
+	if (c.host) return c.host;
+	return '';
+}
+
+function connectionGroupKey(c, groupBy) {
+	if (!c) return '?';
+	if (groupBy === 'app') {
+		return connAppName(c) || connHostName(c) || c.dst || '?';
+	}
+	if (groupBy === 'host') {
+		return connHostName(c) || c.dst || '?';
+	}
+	if (groupBy === 'service') {
+		return c.service || SERVICE_PORTS[c.port] || ('port ' + c.port);
+	}
+	if (groupBy === 'port') return String(c.port);
+	if (groupBy === 'proto') return c.proto || '?';
+	return c.dst || '?';
+}
+
 function groupConnections(conns, groupBy) {
 	if (groupBy === 'none') return null;
-	var keyFn;
-	switch(groupBy) {
-		case 'host':    keyFn = function(c){ return c.host || c.dst || '?'; }; break;
-		case 'service': keyFn = function(c){ return c.service || SERVICE_PORTS[c.port] || ('port '+c.port); }; break;
-		case 'port':    keyFn = function(c){ return String(c.port); }; break;
-		case 'proto':   keyFn = function(c){ return c.proto || '?'; }; break;
-		default:        return null;
-	}
+	if (groupBy !== 'app' && groupBy !== 'host' && groupBy !== 'service' &&
+	    groupBy !== 'port' && groupBy !== 'proto') return null;
 	var groups = {};
 	conns.forEach(function(c) {
-		var k = keyFn(c);
-		if (!groups[k]) groups[k] = {key: k, count: 0, bytes: 0, tcp: 0, udp: 0, sample: c};
+		var k = connectionGroupKey(c, groupBy);
+		if (!groups[k]) groups[k] = {key: k, count: 0, bytes: 0, tcp: 0, udp: 0, sample: c, conns: []};
 		groups[k].count++;
 		groups[k].bytes += (c.bytes || 0);
 		if (c.proto === 'tcp') groups[k].tcp++;
 		else if (c.proto === 'udp') groups[k].udp++;
+		groups[k].conns.push(c);
 	});
 	return Object.keys(groups).map(function(k){ return groups[k]; });
 }
 
-function buildGroupedTable(groups, sortCol, sortDir) {
+function buildGroupedTable(groups, sortCol, sortDir, collapsedMap) {
+	collapsedMap = collapsedMap || {};
 	var cols = [
 		{ key:'key',   label: _('Group'), num:false },
 		{ key:'count', label: _('Conns'), num:true  },
@@ -1109,14 +1138,65 @@ function buildGroupedTable(groups, sortCol, sortDir) {
 		return E('div', { 'class': 'th', 'data-col': c.key, 'data-num': c.num ? '1' : '0' }, c.label + arrow);
 	}));
 
-	var rows = sorted.map(function(r) {
-		return E('div', { 'class': 'tr' }, [
-			E('div', { 'class': 'td tc-c-speed tc-fw-bold' }, escHtml(r.key)),
+	var rows = [];
+	sorted.forEach(function(r) {
+		var collapsed = !!collapsedMap[r.key];
+		var toggle = E('span', { 'class': 'tc-group-toggle', 'aria-hidden': 'true' }, collapsed ? '▸' : '▾');
+		var groupRow = E('div', {
+			'class': 'tr tc-group-row',
+			'data-group': r.key,
+			'title': _('Click to expand or collapse')
+		}, [
+			E('div', { 'class': 'td tc-c-speed tc-fw-bold' }, [toggle, ' ', escHtml(r.key)]),
 			E('div', { 'class': 'td tc-right tc-fw-bold' }, String(r.count)),
 			E('div', { 'class': 'td tc-right tc-c-speed' }, String(r.tcp)),
 			E('div', { 'class': 'td tc-right tc-c-warn' }, String(r.udp)),
 			E('div', { 'class': 'td tc-right tc-mono' }, fmtBytes(r.bytes))
 		]);
+		groupRow.addEventListener('click', function() {
+			if (collapsedMap[r.key]) delete collapsedMap[r.key];
+			else collapsedMap[r.key] = 1;
+			var on = !!collapsedMap[r.key];
+			toggle.textContent = on ? '▸' : '▾';
+			var n = groupRow.nextSibling;
+			while (n && n.getAttribute && n.getAttribute('data-parent') === r.key) {
+				if (on) n.classList.add('tc-hidden');
+				else n.classList.remove('tc-hidden');
+				n = n.nextSibling;
+			}
+		});
+		rows.push(groupRow);
+		(r.conns || []).forEach(function(c) {
+			var dst = c.dst || '';
+			var dstEl = dst
+				? E('a', { 'href': 'https://ipinfo.io/' + dst, 'target': '_blank', 'rel': 'noopener noreferrer',
+				           'class': 'tc-link', 'onclick': 'event.stopPropagation()' }, dst)
+				: '';
+			var host = connHostName(c);
+			var app = connAppName(c);
+			var label = host || app;
+			var detail = [E('span', { 'class': 'tc-mono' }, dstEl || '—')];
+			if (c.port) detail.push(E('span', { 'class': 'tc-c-muted' }, ':' + c.port));
+			if (label && label !== r.key) {
+				detail.push(' ');
+				detail.push(E('span', { 'class': 'tc-app-badge', 'title': app || label }, escHtml(label)));
+			}
+			var mem = E('div', {
+				'class': 'tr tc-group-member' + (collapsed ? ' tc-hidden' : ''),
+				'data-parent': r.key
+			}, [
+				E('div', { 'class': 'td tc-group-member-dst' }, [
+					E('span', { 'class': 'tc-c-muted tc-fw-bold' }, c.proto || ''),
+					' ',
+					E('span', {}, detail)
+				]),
+				E('div', { 'class': 'td' }, ''),
+				E('div', { 'class': 'td' }, ''),
+				E('div', { 'class': 'td' }, ''),
+				E('div', { 'class': 'td tc-right tc-mono' }, fmtBytes(c.bytes))
+			]);
+			rows.push(mem);
+		});
 	});
 
 	return E('div', { 'class': 'table tc-table' }, [titleRow].concat(rows));
@@ -1170,9 +1250,21 @@ function buildTable(conns, sortCol, sortDir, rdnsMode, hiddenCols) {
 			           'class':'tc-link', 'onclick': 'event.stopPropagation()' }, dst)
 			: '';
 
+		var dstCell = E('div', { 'class': 'td tc-mono tc-dst-cell' }, dstEl);
+		var appName = connAppName(r);
+		if (appName) {
+			dstCell.appendChild(document.createTextNode(' '));
+			dstCell.appendChild(E('span', {
+				'class': 'tc-app-badge',
+				'title': connHostName(r) || appName
+			}, escHtml(appName)));
+		}
+
+		var hostLabel = connHostName(r);
 		var hostCell = E('div', { 'class': 'td', 'data-dst': dst });
-		if (r.host) {
-			hostCell.textContent = r.host;
+		if (hostLabel) {
+			hostCell.textContent = hostLabel;
+			if (r.app_host) hostCell.setAttribute('data-app-host', '1');
 		} else if (rdnsMode && !PRIVATE_RE.test(dst)) {
 			hostCell.innerHTML = '<span class="tc-c-faint" style="font-style:italic">' + _('resolving…') + '</span>';
 		} else {
@@ -1181,7 +1273,7 @@ function buildTable(conns, sortCol, sortDir, rdnsMode, hiddenCols) {
 
 		var cellMap = {
 			proto:   E('div', { 'class': 'td tc-fw-bold tc-c-speed' }, r.proto || ''),
-			dst:     E('div', { 'class': 'td tc-mono' }, dstEl),
+			dst:     dstCell,
 			host:    hostCell,
 			port:    E('div', { 'class': 'td tc-right tc-mono' }, String(r.port || '')),
 			service: E('div', { 'class': 'td tc-c-speed' }, escHtml(r.service || (SERVICE_PORTS[r.port]||''))),
@@ -1825,6 +1917,7 @@ return view.extend({
 	_pollMode:     null,
 	_onPopState:   null,
 	_rdnsCache:    {},
+	_collapsedGroups: {},
 	_sortCol:    'bytes',
 	_sortDir:    'desc',
 	_sumCol:     'name',
@@ -2168,6 +2261,7 @@ return view.extend({
 					Array.prototype.forEach.call(
 						connsDiv.querySelectorAll('[data-dst="'+dst+'"]'),
 						function(cell) {
+							if (cell.getAttribute('data-app-host')) return;
 							if (host) { cell.textContent = host; cell.style.color = ''; }
 							else { cell.innerHTML = '<span class="tc-c-faint">—</span>'; }
 						}
@@ -2179,7 +2273,10 @@ return view.extend({
 					self._rdnsCache[dst] = null;
 					Array.prototype.forEach.call(
 						connsDiv.querySelectorAll('[data-dst="'+dst+'"]'),
-						function(cell) { cell.innerHTML = '<span class="tc-c-faint">—</span>'; }
+						function(cell) {
+							if (cell.getAttribute('data-app-host')) return;
+							cell.innerHTML = '<span class="tc-c-faint">—</span>';
+						}
 					);
 				});
 			});
@@ -3240,7 +3337,7 @@ return view.extend({
 					var tbl;
 					if (groupBy !== 'none') {
 						var groups = groupConnections(data.connections, groupBy);
-						tbl = buildGroupedTable(groups, self._sortCol === 'bytes' || self._sortCol === 'count' ? self._sortCol : 'bytes', self._sortDir);
+						tbl = buildGroupedTable(groups, self._sortCol === 'bytes' || self._sortCol === 'count' ? self._sortCol : 'bytes', self._sortDir, self._collapsedGroups);
 						Array.prototype.forEach.call(tbl.querySelectorAll('.th'), function(th) {
 							th.addEventListener('click', function() {
 								var col = th.getAttribute('data-col');
@@ -3285,6 +3382,7 @@ return view.extend({
 									Array.prototype.forEach.call(
 										connsDiv.querySelectorAll('[data-dst="'+dst+'"]'),
 										function(cell) {
+											if (cell.getAttribute('data-app-host')) return;
 											if (cached) { cell.textContent = cached; cell.style.color = ''; }
 											else { cell.innerHTML = '<span class="tc-c-faint">—</span>'; }
 										}

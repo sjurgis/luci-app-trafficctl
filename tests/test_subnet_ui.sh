@@ -140,5 +140,15 @@ assert_eq "a bare address is a device"           "device" \
 assert_eq "a /32 is a device, not a subnet"      "device" \
     "$(node "$TMP/run.js" --is-subnet "192.168.10.55/32")"
 
+# Connection grouping / netify hostname labels. Invoked from here so the
+# existing CI workflow (which lists this file) runs the new assertions
+# without a workflow-file change.
+if bash "$REPO_ROOT/tests/test_conn_groups.sh"; then
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1))
+    printf "FAIL: tests/test_conn_groups.sh\n"
+fi
+
 printf "\n%d passed, %d failed\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

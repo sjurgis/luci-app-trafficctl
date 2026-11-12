@@ -15,6 +15,8 @@ MOCKBIN="$TMPDIR/bin"
 mkdir -p "$MOCKBIN"
 
 CACHE="$TMPDIR/netify_cache.json"
+LABELS="$TMPDIR/netify_labels"
+export TCTL_NETIFY_LABELS="$LABELS"
 
 assert_contains() {
     local desc="$1" needle="$2" haystack="$3"
@@ -90,8 +92,56 @@ assert_contains "parse: top app for routed device" '"ip":"10.0.0.55","top":"BitT
 assert_not_contains "sanitize: no injected quotes" 'evil"host' "$CACHED"
 assert_not_contains "sanitize: no shell metacharacters" 'rm -rf /' "$CACHED"
 
-# ── list ─────────────────────────────────────────────────────────────────────
+# Labels for the device detail view: one row per remote 4-tuple.
+# The first Netflix flow has other_ip + host_server_name; proto falls out
+# of "TLS" as tcp.
+assert_contains "labels: file is written" "yes" "$([ -f "$LABELS" ] && echo yes || echo no)"
+LABELTXT=$(cat "$LABELS" 2>/dev/null)
+assert_contains "labels: netflix mapped to its remote IP" "192.168.1.50 45.57.0.1 tcp 0 netflix www.netflix.com" "$LABELTXT"
+# other_port was absent in this fixture, so port is 0; YouTube still gets a row.
+assert_contains "labels: youtube mapped to its remote IP" "192.168.1.50 142.250.1.1 udp 0 youtube" "$LABELTXT"
+assert_contains "labels: BitTorrent keeps the protocol name" "10.0.0.55 5.5.5.5" "$LABELTXT"
+assert_not_contains "labels: no shell metacharacters in hostname" ';' "$LABELTXT"
+assert_not_contains "labels: no raw quotes in the label file" '"' "$LABELTXT"
+assert_not_contains "labels: spaces stripped from hostile hostname" 'rm -rf' "$LABELTXT"
 
+# ── flow_stats bytes (the bytes:0 bug) ──────────────────────────────────────
+# Identifying flow arrives first with total_bytes still 0; the counters
+# live on a later flow_stats record that has a digest but no local_ip.
+# Without merging those, the app is listed with bytes:0.
+FEED_STATS="$TMPDIR/feed_stats.jsonl"
+cat > "$FEED_STATS" <<'EOF'
+{"type":"agent_hello","version":"5.1.0"}
+{"type":"flow","interface":"br-lan","flow":{"digest":"abc999","local_ip":"192.168.1.80","other_ip":"199.9.9.9","other_port":443,"ip_protocol":6,"detected_application_name":"netify.icloud","host_server_name":"gateway.icloud.com","total_bytes":0}}
+{"type":"flow_stats","interface":"br-lan","flow":{"digest":"abc999","local_bytes":1200,"other_bytes":8800,"total_bytes":10000}}
+{"type":"flow_stats","interface":"br-lan","flow":{"digest":"abc999","local_bytes":1500,"other_bytes":18500,"total_bytes":20000}}
+{"type":"flow","interface":"br-lan","flow":{"digest":"zzz111","local_ip":"192.168.1.80","other_ip":"1.1.1.1","other_port":53,"ip_protocol":17,"detected_protocol_name":"DNS","total_bytes":80}}
+EOF
+rm -f "$CACHE" "$LABELS"
+OUT=$(TCTL_NETIFY_FEED="$FEED_STATS" run_netify collect 2)
+assert_contains "flow_stats: collected" '"ok":true' "$OUT"
+CACHED=$(cat "$CACHE")
+assert_contains "flow_stats: cumulative bytes win over the zero on the first record" '"name":"icloud","bytes":20000' "$CACHED"
+assert_not_contains "flow_stats: zero from the identifying record is not kept" '"bytes":0' "$CACHED"
+assert_contains "flow_stats: a flow that already had bytes is unchanged" '"name":"DNS","bytes":80' "$CACHED"
+LABELTXT=$(cat "$LABELS")
+assert_contains "flow_stats: label carries proto, port and SNI" "192.168.1.80 199.9.9.9 tcp 443 icloud gateway.icloud.com" "$LABELTXT"
+assert_contains "flow_stats: DNS label uses the protocol name and port" "192.168.1.80 1.1.1.1 udp 53 DNS" "$LABELTXT"
+
+# A later collect that sees only the tiny flow must not wipe the icloud label.
+FEED_TINY="$TMPDIR/feed_tiny.jsonl"
+cat > "$FEED_TINY" <<'EOF'
+{"type":"flow","interface":"br-lan","flow":{"digest":"tiny1","local_ip":"192.168.1.80","other_ip":"8.8.8.8","other_port":53,"ip_protocol":17,"detected_protocol_name":"DNS","total_bytes":40}}
+EOF
+OUT=$(TCTL_NETIFY_FEED="$FEED_TINY" run_netify collect 2)
+LABELTXT=$(cat "$LABELS")
+assert_contains "labels: previous mapping survives a later short collect" "192.168.1.80 199.9.9.9 tcp 443 icloud gateway.icloud.com" "$LABELTXT"
+assert_contains "labels: the new mapping is added" "192.168.1.80 8.8.8.8 udp 53 DNS" "$LABELTXT"
+
+# ── list ─────────────────────────────────────────────────────────────────────
+# Re-collect the first fixture so list still sees the original cache.
+rm -f "$CACHE"
+OUT=$(TCTL_NETIFY_FEED="$FEED" run_netify collect 2)
 OUT=$(run_netify list)
 assert_contains "list: returns cached data" '"top":"netflix"' "$OUT"
 
@@ -122,6 +172,27 @@ assert_contains "v5: top app is the biggest by bytes" '"ip":"10.0.20.190","top":
 
 # Routed devices must be represented, not just LAN ones.
 assert_contains "v5: routed device present" '"ip":"10.0.20.142"' "$CACHED"
+
+# Type 1 aggregator records have no other_ip, so they cannot label a conntrack
+# row — that is expected, not a parse failure.
+# A Type 2/3 record (other_ip + other_port) plus a bare numeric application_id
+# must still produce a usable label, using detected_application_name for the
+# numeric id rather than the number itself.
+FEED_T2="$TMPDIR/feed_type2.jsonl"
+cat > "$FEED_T2" <<'EOF'
+{"log_time_end":1,"stats":[{"application_id":"10002.netify.github","download":196,"local_ip":"10.0.20.190","other_ip":"140.82.112.3","other_port":443,"ip_protocol":6,"upload":52}]}
+{"type":"flow","interface":"br-lan","flow":{"digest":"n1","local_ip":"10.0.20.190","other_ip":"8.8.4.4","other_port":853,"ip_protocol":6,"application_id":"12345","detected_application_name":"netify.dot","total_bytes":50}}
+EOF
+rm -f "$CACHE" "$LABELS"
+OUT=$(TCTL_NETIFY_FEED="$FEED_T2" run_netify collect 2)
+assert_contains "type2: collected" '"ok":true' "$OUT"
+CACHED=$(cat "$CACHE")
+assert_contains "type2: github rollup uses the bare app name" '"name":"github"' "$CACHED"
+assert_not_contains "type2: bare numeric application_id is not a name" '"name":"12345"' "$CACHED"
+assert_contains "type2: numeric id falls back to detected application" '"name":"dot"' "$CACHED"
+LABELTXT=$(cat "$LABELS")
+assert_contains "type2: label has proto, port and app" "10.0.20.190 140.82.112.3 tcp 443 github" "$LABELTXT"
+assert_contains "type2: numeric id became the detected name" "10.0.20.190 8.8.4.4 tcp 853 dot" "$LABELTXT"
 
 # ── graceful degradation ─────────────────────────────────────────────────────
 

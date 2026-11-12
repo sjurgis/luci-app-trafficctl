@@ -802,6 +802,21 @@
 	white-space: nowrap;
 }
 
+.tc-dst-cell .tc-app-badge { margin-left: 6px; }
+
+/* Collapsible groups on the device connection table. The group row is the
+   control; member rows stay in the same grid so bytes stay lined up. */
+.tc-group-row { cursor: pointer; }
+.tc-group-row:hover .td { background: var(--tc-hover); }
+.tc-group-toggle {
+	display: inline-block;
+	width: 1em;
+	color: var(--tc-muted);
+	font-weight: 400;
+}
+.tc-group-member .td { color: var(--tc-muted); }
+.tc-group-member-dst { padding-left: 1.6em; }
+
 /* Split down/up speed cell */
 
 /* ── Global overview (bmon-style) ─────────────────────────────────────

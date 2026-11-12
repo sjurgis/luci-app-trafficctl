@@ -26,6 +26,11 @@
 . /usr/libexec/trafficctl/trafficctl-fw.sh
 
 CACHE="/tmp/trafficctl_netify.json"
+# Per-flow labels (local_ip, other_ip, proto, port, app, host), used by the
+# device detail view to tag conntrack rows. A separate file so the existing
+# list/cache JSON (a top-level array of per-device rollups) stays unchanged.
+LABELS="${TCTL_NETIFY_LABELS:-/tmp/trafficctl_netify_labels}"
+LABELS_MAX=4000
 LOCK="/tmp/trafficctl_netify.lock"
 DEFAULT_SOCKET="/var/run/netifyd/netifyd.sock"
 
@@ -114,16 +119,34 @@ do_status() {
         "$installed" "$running" "$sock" "$(netify_endpoint)" "${reader:-none}" "$readable" "$age"
 }
 
-# Aggregate flow records into "per local IP → per application" totals.
+# Aggregate flow records into "per local IP → per application" totals, and
+# a compact per-flow label map used by the device detail view.
 #
 # The agent re-emits a flow as its byte counters grow (flow, flow_dpi_update,
-# flow_dpi_complete), so totals are tracked per flow digest and only summed at
-# the end — adding every sighting would multiply-count the same traffic.
+# flow_dpi_complete, and — on Agent v5 — a separate flow_stats record). Totals
+# are tracked per flow digest and only summed at the end: adding every
+# sighting would multiply-count the same traffic.
+#
+# flow_stats carries digest + byte counters but not local_ip or the
+# application name. Requiring local_ip on every line dropped those updates,
+# so a device's apps were listed with bytes:0 (the identifying flow record
+# often arrives first, with counters still at zero). Byte updates for a
+# digest we already know, or that we will meet later, are kept even when
+# the line has no local_ip. Counters are cumulative, so a later smaller
+# value does not replace a larger one.
+#
+# Labels are written to the file in $1 when it is set: one "local_ip other_ip
+# proto port app host" line per unique 4-tuple, so trafficctl-device.sh can
+# tag conntrack rows without talking to the socket.
 parse_flows() {
     # One JSON object per line so the field extractor sees one record at a
     # time — the aggregator packs every device into a single "stats" array.
-    sed 's/},[ ]*{/}\n{/g' | awk '
-    function field(line, key,   re, seg, v) {
+    # awk gsub, not sed: BusyBox sed treats \n in the replacement as a
+    # literal n, which left the whole array on one line. Braces in the
+    # pattern are written as character classes — BusyBox awk otherwise
+    # treats '{' as the start of an invalid interval (the persist-save bug).
+    awk '{ gsub(/[}][ \t]*,[ \t]*[{]/, "}\n{"); print }' | awk -v labelfile="$1" '
+    function field(line, key,   re, seg) {
         re = "\"" key "\"[ \t]*:[ \t]*"
         if (!match(line, re)) return ""
         seg = substr(line, RSTART + RLENGTH)
@@ -135,37 +158,72 @@ parse_flows() {
         if (!match(seg, /^-?[0-9]+/)) return ""
         return substr(seg, RSTART, RLENGTH) + 0
     }
+    function clean(s) {
+        gsub(/[^a-zA-Z0-9._-]/, "", s)
+        return s
+    }
+    function is_ipv4(s) {
+        return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/
+    }
     {
-        # Only flow-bearing records carry local_ip; skip status/hello lines.
+        digest = field($0, "digest")
         ip = field($0, "local_ip")
-        if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
 
-        # Aggregator records name the app as "<id>.netify.<name>".
         app = field($0, "application_id")
         sub(/^[0-9]+\./, "", app)
-        if (app == "") app = field($0, "detected_application_name")
-        # Agent prefixes catalogued apps with "netify."; the bare name reads
-        # better in a table.
+        # A bare numeric application_id (Aggregator Type 4) is not a name.
+        if (app == "" || app ~ /^[0-9]+$/) app = field($0, "detected_application_name")
         sub(/^netify\./, "", app)
+        host = field($0, "host_server_name")
+        if (host == "") host = field($0, "dns_host_name")
+        host = clean(host)
         if (app == "" || app == "unknown") app = field($0, "detected_protocol_name")
         if (app == "" || app == "Unknown") {
-            host = field($0, "host_server_name")
             if (host != "") app = host; else app = "unclassified"
         }
-        gsub(/[^a-zA-Z0-9._ -]/, "", app)
+        app = clean(app)
         if (app == "") app = "unclassified"
 
-        digest = field($0, "digest")
-        # Aggregator: per-interval byte deltas, already summed per device+app.
+        dst = field($0, "other_ip")
+        port = field($0, "other_port") + 0
+        ipproto = field($0, "ip_protocol") + 0
+        proto = ""
+        if (ipproto == 6) proto = "tcp"
+        else if (ipproto == 17) proto = "udp"
+        else {
+            pn = tolower(field($0, "detected_protocol_name"))
+            if (pn ~ /quic/) proto = "udp"
+            else if (pn ~ /tcp|tls|http|ssl|ssh|ftp|smtp|imap|pop/) proto = "tcp"
+            else if (pn ~ /udp|dns|wireguard/) proto = "udp"
+        }
+        # Empty proto would collapse awk fields in the label file (a blank
+        # token is dropped), so use a placeholder the device matcher treats
+        # as "any".
+        if (proto == "") proto = "-"
+
         bytes = field($0, "download") + field($0, "upload")
         if (bytes == 0) bytes = field($0, "total_bytes")
-        if (bytes == "" || bytes == 0) bytes = field($0, "local_bytes") + field($0, "other_bytes")
-        if (digest == "") digest = ip "|" app "|" NR
+        if (bytes == 0) bytes = field($0, "local_bytes") + field($0, "other_bytes")
+        bytes = bytes + 0
+
+        if (digest == "" && is_ipv4(ip)) digest = "agg|" ip "|" app "|" NR
+
+        if (digest != "") {
+            if (!(digest in dbytes) || bytes > dbytes[digest]) dbytes[digest] = bytes
+        }
+
+        if (!is_ipv4(ip)) next
 
         key = ip SUBSEP app
-        # Last sighting of a digest carries its cumulative total.
-        if (!(digest in seen)) { seen[digest] = key; flows[key]++ }
-        dbytes[digest] = bytes + 0
+        if (digest != "" && !(digest in seen)) { seen[digest] = key; flows[key]++ }
+
+        if (is_ipv4(dst) && labelfile != "") {
+            lkey = ip " " dst " " proto " " port
+            # Prefer a real app name over unclassified, and a hostname over
+            # an empty one, if the same 4-tuple is seen more than once.
+            if (!(lkey in lapp) || (lapp[lkey] == "unclassified" && app != "unclassified")) lapp[lkey] = app
+            if (host != "" && (lhost[lkey] == "" || length(host) > length(lhost[lkey]))) lhost[lkey] = host
+        }
     }
     END {
         for (d in seen) total[seen[d]] += dbytes[d]
@@ -173,13 +231,40 @@ parse_flows() {
             split(k, p, SUBSEP)
             printf "%s %s %.0f %d\n", p[1], p[2], total[k], flows[k]
         }
+        if (labelfile != "") {
+            for (lkey in lapp) {
+                h = lhost[lkey]
+                if (h == "") h = "-"
+                print lkey, lapp[lkey], h > labelfile
+            }
+            close(labelfile)
+        }
     }'
+}
+
+# Keep labels learned on earlier samples so a short collect window does not
+# wipe the detail view. New keys win; older keys fill the remainder, up to
+# LABELS_MAX lines (~a few hundred KB — cheap on a 128 MB router).
+merge_labels() {
+    local fresh="$1" out="$2"
+    {
+        [ -f "$fresh" ] && cat "$fresh"
+        [ -f "$LABELS" ] && cat "$LABELS"
+    } | awk -v max="$LABELS_MAX" '
+        NF >= 6 {
+            key = $1 " " $2 " " $3 " " $4
+            if (key in seen) next
+            seen[key] = 1
+            print
+            if (++n >= max) exit
+        }' > "$out"
+    mv "$out" "$LABELS"
 }
 
 do_collect() {
     # The aggregator publishes on an interval (~15s), so a short sample window
     # usually catches nothing at all — wait long enough to span one report.
-    local secs="${1:-18}" raw parsed tmp
+    local secs="${1:-18}" raw parsed tmp labels_tmp labels_new
     case "$secs" in ''|*[!0-9]*) secs=18 ;; esac
     [ "$secs" -lt 1 ] && secs=1
     [ "$secs" -gt 60 ] && secs=60
@@ -198,7 +283,11 @@ do_collect() {
         return 0
     fi
 
-    parsed=$(printf '%s\n' "$raw" | parse_flows)
+    labels_tmp="${LABELS}.tmp"
+    labels_new="${LABELS}.new"
+    parsed=$(printf '%s\n' "$raw" | parse_flows "$labels_new")
+    merge_labels "$labels_new" "$labels_tmp"
+    rm -f "$labels_new"
     tmp="${CACHE}.tmp"
     # Group by IP, apps sorted by bytes descending.
     printf '%s\n' "$parsed" | sort -k1,1 -k3,3nr | awk '
